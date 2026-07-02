@@ -73,6 +73,28 @@
   }
   .summary { font-size: 13px; color: var(--sub); margin-top: 10px; text-align: center; }
   #result { display: none; }
+  /* 進捗チェック & 並べ替え */
+  .stop .body { flex: 1; }
+  .stop .handle {
+    align-self: center; color: var(--sub); font-size: 22px; line-height: 1;
+    padding: 6px 4px 6px 8px; cursor: grab; touch-action: none; user-select: none;
+    -webkit-user-select: none; flex-shrink: 0;
+  }
+  .stop.dragging { opacity: .55; background: var(--card2); border-radius: 8px; }
+  .stop.done .addr { text-decoration: line-through; color: var(--sub); }
+  .stop.done .num { background: var(--sub); }
+  .stop .num.check::after { content: '✓'; }
+  .stop .body { cursor: pointer; }
+  .result-head {
+    display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;
+  }
+  .progress { font-size: 13px; color: var(--sub); }
+  .progress b { color: var(--accent2); }
+  .btn-reset {
+    background: var(--card2); border: 1px solid #2e3a52; color: var(--sub);
+    font-size: 12px; font-weight: 600; padding: 6px 10px;
+  }
+  .hint { font-size: 12px; color: var(--sub); margin: 2px 0 8px; }
 </style>
 </head>
 <body>
@@ -101,10 +123,15 @@
   </div>
 
   <div class="card" id="result">
-    <label>最適ルート順</label>
+    <div class="result-head">
+      <label style="margin:0">配達ルート</label>
+      <div class="progress" id="progress"></div>
+    </div>
+    <div class="hint">タップで配達完了 / ≡ を長押しドラッグで順番変更</div>
     <div id="stops"></div>
     <div id="links"></div>
     <div class="summary" id="summary"></div>
+    <button class="btn-reset" id="btnReset" style="width:100%;margin-top:10px">進捗をリセット</button>
   </div>
 
 <script>
@@ -121,6 +148,190 @@
   $('roundtrip').checked = localStorage.getItem('roundtrip') === '1';
 
   let currentPos = null;
+
+  // === ルート状態(進捗チェック & 並べ替え) ===
+  let routeStops = [];   // [出発地, 配送先1, 配送先2, ...] の順序付き配列
+  let routeRound = false;
+  let doneIds = new Set();
+
+  function saveRoute() {
+    try {
+      localStorage.setItem('saved_route', JSON.stringify(routeStops));
+      localStorage.setItem('saved_round', routeRound ? '1' : '');
+      localStorage.setItem('saved_done', JSON.stringify([...doneIds]));
+    } catch (_) {}
+  }
+  function loadRoute() {
+    try {
+      const r = JSON.parse(localStorage.getItem('saved_route') || 'null');
+      if (r && r.length) {
+        routeStops = r;
+        routeRound = localStorage.getItem('saved_round') === '1';
+        doneIds = new Set(JSON.parse(localStorage.getItem('saved_done') || '[]'));
+        renderRoute();
+        $('result').style.display = 'block';
+      }
+    } catch (_) {}
+  }
+
+  function computeTotal(stops, round) {
+    let t = 0;
+    for (let i = 0; i < stops.length - 1; i++) t += dist(stops[i], stops[i + 1]);
+    if (round && stops.length > 1) t += dist(stops[stops.length - 1], stops[0]);
+    return t;
+  }
+
+  function currentDelivOrder() {
+    const list = $('deliv');
+    if (!list) return routeStops.slice(1);
+    const byId = new Map(routeStops.map(p => [p._id, p]));
+    return [...list.children].map(c => byId.get(c.dataset.id)).filter(Boolean);
+  }
+
+  function makeStaticRow(badge, label, matched) {
+    const div = document.createElement('div');
+    div.className = 'stop';
+    div.innerHTML = `<div class="num start"></div><div class="body"><div class="addr"></div><div class="matched"></div></div>`;
+    div.querySelector('.num').textContent = badge;
+    div.querySelector('.addr').textContent = label;
+    if (matched && matched !== label) div.querySelector('.matched').textContent = matched;
+    return div;
+  }
+
+  function makeDelivRow(p) {
+    const div = document.createElement('div');
+    div.className = 'stop' + (doneIds.has(p._id) ? ' done' : '');
+    div.dataset.id = p._id;
+    div.innerHTML = `<div class="num"></div><div class="body"><div class="addr"></div><div class="matched"></div></div><div class="handle">≡</div>`;
+    div.querySelector('.addr').textContent = p.label;
+    if (p.matched && p.matched !== p.label) div.querySelector('.matched').textContent = p.matched;
+    div.querySelector('.body').addEventListener('click', () => toggleDone(p._id));
+    const handle = div.querySelector('.handle');
+    handle.addEventListener('pointerdown', e => startDrag(e, div, handle));
+    return div;
+  }
+
+  function renderRoute() {
+    if (!routeStops.length) return;
+    const origin = routeStops[0];
+    const delivs = routeStops.slice(1);
+    const stopsEl = $('stops');
+    stopsEl.innerHTML = '';
+    stopsEl.appendChild(makeStaticRow('S', origin.label, origin.matched));
+    const list = document.createElement('div');
+    list.id = 'deliv';
+    delivs.forEach(p => list.appendChild(makeDelivRow(p)));
+    stopsEl.appendChild(list);
+    if (routeRound) stopsEl.appendChild(makeStaticRow('G', '出発地に戻る', ''));
+    renumber();
+    rebuildLinks();
+    updateProgress();
+  }
+
+  function renumber() {
+    const list = $('deliv');
+    if (!list) return;
+    [...list.children].forEach((row, i) => {
+      const num = row.querySelector('.num');
+      const done = row.classList.contains('done');
+      num.classList.toggle('check', done);
+      num.textContent = done ? '' : (i + 1);
+    });
+  }
+
+  function toggleDone(id) {
+    if (doneIds.has(id)) doneIds.delete(id); else doneIds.add(id);
+    const row = document.querySelector(`#deliv .stop[data-id="${id}"]`);
+    if (row) row.classList.toggle('done');
+    renumber();
+    rebuildLinks();
+    updateProgress();
+    saveRoute();
+  }
+
+  function updateProgress() {
+    const ids = new Set(routeStops.slice(1).map(p => p._id));
+    const total = ids.size;
+    const done = [...doneIds].filter(id => ids.has(id)).length;
+    $('progress').innerHTML = `完了 <b>${done}</b> / ${total}`;
+  }
+
+  function rebuildLinks() {
+    const origin = routeStops[0];
+    const order = currentDelivOrder();
+    const remaining = order.filter(p => !doneIds.has(p._id));
+    const linksEl = $('links');
+    linksEl.innerHTML = '';
+    if (!remaining.length) {
+      const d = document.createElement('div');
+      d.className = 'maplink';
+      d.style.background = 'var(--card2)';
+      d.textContent = '🎉 全件配達完了!';
+      linksEl.appendChild(d);
+      $('summary').textContent = 'お疲れさまでした。';
+      return;
+    }
+    const links = mapsLinks([origin, ...remaining], routeRound);
+    links.forEach((url, i) => {
+      const a = document.createElement('a');
+      a.className = 'maplink';
+      a.href = url; a.target = '_blank'; a.rel = 'noopener';
+      a.textContent = links.length > 1
+        ? `🗺 残りをナビ (${i + 1}/${links.length})`
+        : '🗺 残りをGoogleマップでナビ';
+      linksEl.appendChild(a);
+    });
+    const totalKm = computeTotal([origin, ...order], routeRound);
+    $('summary').textContent =
+      `残り${remaining.length}件 / 全${order.length}件 / 計画距離 約${totalKm.toFixed(1)} km` +
+      (links.length > 1 ? ` / ${links.length}区間に分割` : '');
+  }
+
+  // --- ドラッグで並べ替え(タッチ対応) ---
+  function rowAfter(list, y) {
+    const rows = [...list.querySelectorAll('.stop:not(.dragging)')];
+    for (const r of rows) {
+      const box = r.getBoundingClientRect();
+      if (y < box.top + box.height / 2) return r;
+    }
+    return null;
+  }
+  function startDrag(e, row, handle) {
+    e.preventDefault();
+    const list = $('deliv');
+    row.classList.add('dragging');
+    try { handle.setPointerCapture(e.pointerId); } catch (_) {}
+    const onMove = ev => {
+      const after = rowAfter(list, ev.clientY);
+      if (after == null) list.appendChild(row);
+      else list.insertBefore(row, after);
+    };
+    const onUp = () => {
+      row.classList.remove('dragging');
+      try { handle.releasePointerCapture(e.pointerId); } catch (_) {}
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', onUp);
+      handle.removeEventListener('pointercancel', onUp);
+      commitOrder();
+    };
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+    handle.addEventListener('pointercancel', onUp);
+  }
+  function commitOrder() {
+    routeStops = [routeStops[0], ...currentDelivOrder()];
+    saveRoute();
+    renumber();
+    rebuildLinks();
+  }
+
+  $('btnReset').onclick = () => {
+    if (!routeStops.length) return;
+    doneIds = new Set();
+    saveRoute();
+    renderRoute();
+    status('進捗をリセットしました。');
+  };
 
   $('btnLoc').onclick = () => {
     status('現在地を取得中...');
@@ -344,48 +555,17 @@
       if (pts.length < 2) { status('有効な住所がありません。', true); return; }
 
       status('最適ルートを計算中...');
-      const { route, total } = optimize(pts, roundtrip);
+      const { route } = optimize(pts, roundtrip);
       const ordered = route.map(i => pts[i]);
 
-      // 結果表示
-      const stopsEl = $('stops');
-      stopsEl.innerHTML = '';
-      ordered.forEach((p, i) => {
-        const div = document.createElement('div');
-        div.className = 'stop';
-        const isStart = i === 0;
-        div.innerHTML =
-          `<div class="num ${isStart ? 'start' : ''}">${isStart ? 'S' : i}</div>
-           <div><div class="addr"></div><div class="matched"></div></div>`;
-        div.querySelector('.addr').textContent = p.label;
-        div.querySelector('.matched').textContent = p.matched !== p.label ? p.matched : '';
-        stopsEl.appendChild(div);
-      });
-      if (roundtrip) {
-        const div = document.createElement('div');
-        div.className = 'stop';
-        div.innerHTML = `<div class="num start">G</div><div class="addr">出発地に戻る</div>`;
-        stopsEl.appendChild(div);
-      }
-
-      const linksEl = $('links');
-      linksEl.innerHTML = '';
-      const links = mapsLinks(ordered, roundtrip);
-      links.forEach((url, i) => {
-        const a = document.createElement('a');
-        a.className = 'maplink';
-        a.href = url;
-        a.target = '_blank';
-        a.rel = 'noopener';
-        a.textContent = links.length > 1
-          ? `🗺 Googleマップでナビ (${i + 1}/${links.length})`
-          : '🗺 Googleマップでナビ開始';
-        linksEl.appendChild(a);
-      });
-
-      $('summary').textContent =
-        `全${ordered.length - 1}件 / 直線距離合計 約${total.toFixed(1)} km` +
-        (links.length > 1 ? ` / 経由地上限のため${links.length}区間に分割` : '');
+      // ルート状態を確定(各配送先に安定IDを付与)し、進捗はリセット
+      routeStops = ordered.map((p, i) => ({
+        ...p, _id: i + '_' + Math.random().toString(36).slice(2, 8)
+      }));
+      routeRound = roundtrip;
+      doneIds = new Set();
+      saveRoute();
+      renderRoute();
       $('result').style.display = 'block';
 
       status(failed.length
@@ -397,6 +577,9 @@
       $('btnGo').disabled = false;
     }
   };
+
+  // 前回のルートと進捗を復元
+  loadRoute();
 })();
 </script>
 </body>
